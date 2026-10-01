@@ -5,6 +5,7 @@
 - POST /api/network/import                             整网导入（替换式，版本重置为 1）
 - GET  /api/network                                    读取当前管网与版本
 - POST /api/isolation/preview                          隔离方案预演（只读）
+- POST /api/isolation/suggest                          关阀建议（只读，只给故障管段）
 - POST /api/isolation/submit                           隔离方案提交（原子关阀 + 版本 +1）
 - GET  /api/isolation/events                           隔离/复供操作历史
 - POST /api/isolation/events/{event_id}/restore/preview 复供预演（只读）
@@ -22,16 +23,20 @@ from .planning import (
     Pipe,
     evaluate_plan,
     evaluate_restore,
+    suggest_plan,
     validate_import,
     BLOCKING_ISSUE_CODES,
+    SuggestionLimitExceeded,
 )
 from .schemas import (
     ImportIn,
     PlanIn,
+    SuggestIn,
     RestoreIn,
     ImportOut,
     NetworkOut,
     PreviewOut,
+    SuggestOut,
     SubmitOut,
     RestorePreviewOut,
     RestoreOut,
@@ -39,6 +44,7 @@ from .schemas import (
 )
 from .serializers import (
     serialize_preview,
+    serialize_suggestion,
     serialize_restore_preview,
     serialize_snapshot,
 )
@@ -61,7 +67,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="供水管网故障隔离服务",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -177,6 +183,38 @@ def preview_isolation(payload: PlanIn):
     )
     return serialize_preview(
         version, payload.version, payload.fault_pipe_id, payload.close_pipe_ids, result
+    )
+
+
+@app.post(
+    "/api/isolation/suggest",
+    response_model=SuggestOut,
+    tags=["故障隔离"],
+    summary="关阀建议：只给故障管段，只读返回可直接提交的最优关阀集合",
+)
+def suggest_isolation(payload: SuggestIn):
+    with db.get_conn() as conn:
+        version, _updated_at, nodes, pipes = db.load_snapshot(conn)
+        pending_fault_ids = frozenset(
+            e["fault_pipe_id"] for e in db.list_open_events(conn)
+        )
+
+    try:
+        result = suggest_plan(
+            nodes,
+            pipes,
+            payload.fault_pipe_id,
+            pending_fault_pipe_ids=pending_fault_ids,
+            max_nodes=get_settings().suggest_max_nodes,
+        )
+    except SuggestionLimitExceeded as exc:
+        raise ApiError(
+            500,
+            "SUGGESTION_COMPUTATION_LIMIT",
+            str(exc),
+        )
+    return serialize_suggestion(
+        version, payload.version, payload.fault_pipe_id, result
     )
 
 

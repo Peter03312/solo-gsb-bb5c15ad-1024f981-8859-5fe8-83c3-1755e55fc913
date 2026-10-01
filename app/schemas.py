@@ -49,6 +49,13 @@ class PlanIn(BaseModel):
     version: int = Field(ge=0, description="读取管网时的版本号，空网为 0")
 
 
+class SuggestIn(BaseModel):
+    """关阀建议入参：操作员只需给出故障管段编号与读取版本。"""
+
+    fault_pipe_id: str = Field(min_length=1, description="故障管段编号")
+    version: int = Field(ge=0, description="读取管网时的版本号，空网为 0")
+
+
 # ---------------------------------------------------------------- 响应模型
 
 
@@ -95,6 +102,20 @@ class PreviewOut(BaseModel):
     isolatable: bool
     affected_sink_ids: list[str]
     issues: list[IssueOut]
+
+
+class SuggestOut(BaseModel):
+    version: int
+    version_match: bool
+    fault_pipe_id: str
+    feasible: bool
+    # 建议本次关闭的“尚未关闭”阀门（按编号排序），可直接用于隔离提交
+    close_pipe_ids: list[str]
+    # 预计相对当前状态新增失供的用水点（按编号排序）
+    affected_sink_ids: list[str]
+    # feasible=false 时的原因：FAULT_PIPE_NOT_FOUND / NO_FEASIBLE_PLAN
+    reason_code: str | None = None
+    reason_message: str | None = None
 
 
 class SubmitOut(BaseModel):

@@ -4,6 +4,7 @@
 
 支持录入带编号的**水源(source)**、**用水点(sink)**、**连接点(junction)**及两端节点明确的**管段**（管段可设阀门）；
 针对一条故障管段，预演并提交阀门关闭方案，自动判断**能否隔离**并计算**失供用水点**；
+操作员只知道故障管段时，也可由系统**只读给出一套可直接提交的关阀建议**；
 隔离提交后生成带编号的隔离事件（区分**待修复 open / 已复供 restored**），
 修复完成后操作员按**事件编号 + 当前管网版本**预演并确认**复供**，系统复核重开阀门后其余待修复故障是否仍被安全隔离。
 
@@ -49,6 +50,7 @@ docker compose down -v       # 同时清空数据库数据卷
 | `DB_CONNECT_RETRIES` | `30` | 启动时等待数据库就绪的重试次数 |
 | `DB_CONNECT_RETRY_INTERVAL` | `1.0` | 重试间隔秒数 |
 | `HISTORY_LIMIT` | `100` | 历史记录接口返回上限 |
+| `SUGGEST_MAX_NODES` | `100000` | 关阀建议分支限界搜索的最大分支节点数（极端网状管网保护） |
 
 ### 本地（非 Docker）运行
 
@@ -75,6 +77,25 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
   方案前已经失供的点不会重复计入。
 - 其他**待修复(open)**隔离事件的故障管段在方案前/方案后均视为不可通行（故障仍在，不能通水）；
   已复供(restored)事件的故障管段不再计入。
+
+**关阀建议**（`POST /api/isolation/suggest`，只读；操作员只需提供故障管段编号与已读版本）：
+
+- 系统按**当前管网**计算一套可直接提交的关阀方案，返回当前版本、`version_match`、
+  拟关闭的**尚未关闭阀门**（`close_pipe_ids`，按编号排序）与预计**新增失供用水点**
+  （`affected_sink_ids`）；建议本身**不改阀位、版本与事件状态**。
+- 计算口径与隔离判定一致：**已关闭阀门**、其他**待修复(open)**事件的故障管段
+  均不可通行；本次故障管段两端都必须与所有水源断开。
+- 本次只能关闭**尚未关闭的有阀管段**：故障管段本身、其他待修复故障管段
+  （无论是否有阀）均不会出现在建议中。
+- 可行方案择优顺序：① 相对当前状态**新增失供用水点数最少**；② **本次关阀数最少**；
+  ③ 仍并列时取关阀编号序列（排序后）**字典序最小**。
+- 故障管段在当前态已被隔离（如已有关阀或待修复故障切断了片区）时，返回
+  `feasible=true` 且 `close_pipe_ids=[]`，空方案可直接提交。
+- 明确返回原因且不改状态的情况：故障管段不存在（`reason_code=FAULT_PIPE_NOT_FOUND`）、
+  关闭全部可用阀门后故障管段仍有一端可从水源到达（`NO_FEASIBLE_PLAN`）。
+- 版本过期不拒绝（与隔离/复供预演一致），仅返回 `version_match=false`：
+  建议仍按当前管网计算，但**提交仍走现有 `/api/isolation/submit` 接口并按最新状态复核**，
+  过期版本提交照旧返回 `409 VERSION_CONFLICT`。
 
 **提交约束**（任一不满足即拒绝且不改任何状态）：
 
@@ -108,6 +129,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 | POST | `/api/network/import` | 整网导入（版本重置为 1，旧事件失效） |
 | GET | `/api/network` | 读取当前管网与版本 |
 | POST | `/api/isolation/preview` | 隔离方案预演（只读，计入待修复故障） |
+| POST | `/api/isolation/suggest` | 关阀建议（只读，只给故障管段，返回可提交的最优阀门集合） |
 | POST | `/api/isolation/submit` | 提交隔离（原子关阀 + 版本 +1，事件状态 open） |
 | GET | `/api/isolation/events` | 隔离/复供操作历史（含 open / restored 状态） |
 | POST | `/api/isolation/events/{event_id}/restore/preview` | 复供预演（只读） |
@@ -159,7 +181,47 @@ curl -s -X POST http://localhost:8000/api/network/import \
 curl -s http://localhost:8000/api/network
 ```
 
-### 3. 预演：只关 P5（不能隔离）
+### 3. 关阀建议（操作员只知道故障管段）
+
+```bash
+curl -s -X POST http://localhost:8000/api/isolation/suggest \
+  -H 'Content-Type: application/json' \
+  -d '{"fault_pipe_id":"P6","version":1}'
+```
+
+系统只读搜索当前管网（已关阀门与待修复故障继续阻断），返回一套可直接提交的方案：
+
+```json
+{
+  "version": 1,
+  "version_match": true,
+  "fault_pipe_id": "P6",
+  "feasible": true,
+  "close_pipe_ids": ["P4"],
+  "affected_sink_ids": ["U3"],
+  "reason_code": null,
+  "reason_message": null
+}
+```
+
+择优规则：新增失供用水点最少（关 P1/P2 会牵连 U1、关 P3 会牵连 U1/U3，均劣于 P4）→
+关阀数最少 → 编号字典序最小。把 `close_pipe_ids` 原样带入第 6 步的提交接口即可；
+`version_match=false` 表示版本已过期，应重新读取版本后再提交（提交接口会再复核）。
+
+故障管段不存在或无可行方案时同样返回 HTTP 200，但 `feasible=false` 并给出原因，
+**不改任何状态**：
+
+```bash
+curl -s -X POST http://localhost:8000/api/isolation/suggest \
+  -H 'Content-Type: application/json' \
+  -d '{"fault_pipe_id":"NOPE","version":1}'
+# {"feasible": false, "reason_code": "FAULT_PIPE_NOT_FOUND", ...}
+```
+
+极端网状管网搜索触达 `SUGGEST_MAX_NODES` 上限时返回 `500 SUGGESTION_COMPUTATION_LIMIT`
+（保护性失败，不代表无方案，且不改变状态）。
+
+### 4. 预演：只关 P5（不能隔离）
 
 ```bash
 curl -s -X POST http://localhost:8000/api/isolation/preview \
@@ -169,7 +231,7 @@ curl -s -X POST http://localhost:8000/api/isolation/preview \
 
 `D` 点仍可经 P4 进水，故障管段 P6 的 D 端仍可达，故 `isolatable=false`。
 
-### 4. 预演：关 P4（可以隔离，仅 U3 失供）
+### 5. 预演：关 P4（可以隔离，仅 U3 失供）
 
 ```bash
 curl -s -X POST http://localhost:8000/api/isolation/preview \
@@ -193,7 +255,7 @@ curl -s -X POST http://localhost:8000/api/isolation/preview \
 
 `version_match=false` 表示你读取的版本已过期（预演仍基于当前管网计算，但不应直接提交）。
 
-### 5. 提交隔离
+### 6. 提交隔离（可直接采用第 3 步建议的 `close_pipe_ids`）
 
 ```bash
 curl -s -X POST http://localhost:8000/api/isolation/submit \
@@ -220,7 +282,7 @@ curl -s -X POST http://localhost:8000/api/isolation/submit \
 - 关闭无阀管段 `P6` → `422 PLAN_INVALID` / `CLOSE_PIPE_NO_VALVE`；
 - 提交不可隔离方案 → `422 NOT_ISOLATABLE`。
 
-### 6. 隔离历史
+### 7. 隔离历史
 
 ```bash
 curl -s http://localhost:8000/api/isolation/events
@@ -243,7 +305,7 @@ curl -s http://localhost:8000/api/isolation/events
 }
 ```
 
-### 7. 复供预演与确认（按事件编号 + 当前版本）
+### 8. 复供预演与确认（按事件编号 + 当前版本）
 
 复供演示使用包含两个叠加故障的管网 `examples/restore_network.json`：
 
@@ -349,7 +411,7 @@ python3 examples/demo.py
 python3 examples/demo.py http://localhost:8000
 ```
 
-脚本依次演示：导入 → 读取版本 → 不可行/可行预演 → 过期版本 409 → 成功提交 → 重复提交 409 → 重复关阀 422 → 历史。
+脚本依次演示：导入 → 读取版本 → 关阀建议（只读）→ 不可行/可行预演 → 过期版本 409 → 成功提交 → 重复提交 409 → 已隔离后空建议 → 重复关阀 422 → 历史。
 
 复供流程（两条叠加故障：风险拒绝 → 区内事件安全复供 → 版本/状态拒绝 → 外层事件安全复供 → 历史）：
 
@@ -361,13 +423,13 @@ python3 examples/restore_demo.py http://localhost:8000
 
 ## 七、测试
 
-核心图算法与校验逻辑（`tests/test_planning.py`，22 个用例）不依赖数据库与第三方库，可直接用标准库运行：
+核心图算法与校验逻辑（`tests/test_planning.py`，33 个用例）不依赖数据库与第三方库，可直接用标准库运行：
 
 ```bash
 python3 -m unittest tests.test_planning -v
 ```
 
-路由层集成测试（`tests/test_api.py`，23 个用例）用内存替身替换数据库，覆盖完整 HTTP 契约（含复供预演/确认、版本与安全拒绝、整网替换失效），需先安装依赖：
+路由层集成测试（`tests/test_api.py`，30 个用例）用内存替身替换数据库，覆盖完整 HTTP 契约（含关阀建议、复供预演/确认、版本与安全拒绝、整网替换失效），需先安装依赖：
 
 ```bash
 pip install -r requirements.txt httpx
@@ -380,7 +442,7 @@ python3 -m unittest discover -s tests -v
 app/
   config.py       # 环境变量配置
   schemas.py      # Pydantic 请求/响应模型
-  planning.py     # 纯领域逻辑：导入校验、无向图可达性(BFS)、隔离评估、复供安全评估
+  planning.py     # 纯领域逻辑：导入校验、无向图可达性(BFS)、隔离评估、关阀建议(分支限界)、复供安全评估
   db.py           # PostgreSQL：DDL/迁移、快照、整网导入、事务化隔离提交、事务化复供、历史
   serializers.py  # 响应序列化
   main.py         # FastAPI 路由与错误处理

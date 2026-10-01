@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     db_connect_retry_interval: float = 1.0
     # 历史记录接口最多返回条数
     history_limit: int = 100
+    # 关阀建议分支限界搜索的最大分支节点数（极端网状管网的保护上限；
+    # 超出后返回 500 SUGGESTION_COMPUTATION_LIMIT，不改状态）
+    suggest_max_nodes: int = 20_000
 
 
 @lru_cache
