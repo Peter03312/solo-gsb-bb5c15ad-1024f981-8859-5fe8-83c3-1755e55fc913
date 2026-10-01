@@ -14,11 +14,18 @@
   再继续移除“其他待修复事件”的故障管段。
 - 仅当重开后，其余每条待修复故障管段的**两端**都仍无法从水源到达，才允许复供。
 - 预计恢复供水用水点 = 复供前不可达、复供图中可达的 sink，按编号排序。
+
+关阀建议（recommend）规则：
+- 只读计算：为故障管段给出一套可直接提交的关阀方案（拟关阀门 + 预计失供用水点）。
+- 只能从尚未关闭的有阀管段中选取（不含故障管段本身），方案须使故障管段两端
+  都与所有水源断开；优选顺序：新增失供用水点数最少 → 本次关阀数最少 →
+  关阀编号序列字典序最小。
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from collections import deque
+from itertools import combinations
 
 # 问题代码 ---------------------------------------------------------------
 
@@ -30,6 +37,8 @@ CLOSE_PIPE_DUPLICATE = "CLOSE_PIPE_DUPLICATE"
 CLOSE_PIPE_IS_FAULT = "CLOSE_PIPE_IS_FAULT"
 # 复供阻断：重开阀门后其他待修复故障管段有一端重新进水
 FAULT_REWATER_RISK = "FAULT_REWATER_RISK"
+# 关阀建议：关闭全部可用阀门后故障管段仍有端点与水源相通
+NO_FEASIBLE_PLAN = "NO_FEASIBLE_PLAN"
 # 导入期问题
 DUPLICATE_NODE_ID = "DUPLICATE_NODE_ID"
 DUPLICATE_PIPE_ID = "DUPLICATE_PIPE_ID"
@@ -113,6 +122,21 @@ class RestoreResult:
     blocked_pipe_ids: frozenset[str] = field(default_factory=frozenset)
 
 
+@dataclass
+class RecommendResult:
+    """关阀建议结果（只读计算，不改任何状态）。
+
+    feasible=False 时 reason 给出原因：
+    - FAULT_PIPE_NOT_FOUND：故障管段不存在；
+    - NO_FEASIBLE_PLAN：关闭全部可用阀门后故障管段仍有端点与水源相通。
+    """
+
+    feasible: bool
+    recommended_close_pipe_ids: list[str]
+    affected_sink_ids: list[str]
+    reason: Issue | None = None
+
+
 # ---------------------------------------------------------------- 导入校验
 
 
@@ -159,12 +183,13 @@ def validate_import(
 # ---------------------------------------------------------------- 可达性
 
 
-def _reachable(
+def _reachable_from(
     nodes: dict[str, Node],
     pipes: list[Pipe],
     removed_pipe_ids: frozenset[str],
+    seeds,
 ) -> set[str]:
-    """无向 BFS：从全部水源出发，返回可达节点集合。
+    """无向 BFS：从 seeds 出发，返回可达节点集合。
 
     removed_pipe_ids 中的管段视为不存在/不可通行。
     """
@@ -179,11 +204,10 @@ def _reachable(
 
     reachable: set[str] = set()
     queue: deque[str] = deque()
-    for nid, node in nodes.items():
-        if node.type == "source":
-            if nid not in reachable:
-                reachable.add(nid)
-                queue.append(nid)
+    for nid in seeds:
+        if nid in nodes and nid not in reachable:
+            reachable.add(nid)
+            queue.append(nid)
 
     while queue:
         current = queue.popleft()
@@ -192,6 +216,20 @@ def _reachable(
                 reachable.add(nxt)
                 queue.append(nxt)
     return reachable
+
+
+def _reachable(
+    nodes: dict[str, Node],
+    pipes: list[Pipe],
+    removed_pipe_ids: frozenset[str],
+) -> set[str]:
+    """无向 BFS：从全部水源出发，返回可达节点集合。"""
+    return _reachable_from(
+        nodes,
+        pipes,
+        removed_pipe_ids,
+        [nid for nid, node in nodes.items() if node.type == "source"],
+    )
 
 
 # ---------------------------------------------------------------- 方案评估
@@ -359,4 +397,123 @@ def evaluate_restore(
         restored_sink_ids=restored,
         blocks=blocks,
         blocked_pipe_ids=frozenset(after_removed),
+    )
+
+
+# ---------------------------------------------------------------- 关阀建议
+
+
+def recommend_plan(
+    nodes: dict[str, Node],
+    pipes: dict[str, Pipe],
+    fault_pipe_id: str,
+    *,
+    pending_fault_pipe_ids: frozenset[str] = frozenset(),
+) -> RecommendResult:
+    """按当前管网为故障管段计算一套可提交的关阀建议（只读，不改任何状态）。
+
+    规则：
+    - 已关闭阀门与其他待修复事件的故障管段均不可通行；
+    - 只能从“尚未关闭的有阀管段”中选取，且不含故障管段本身
+      （与提交接口 CLOSE_PIPE_IS_FAULT / CLOSE_PIPE_DUPLICATE 约束一致，
+      保证建议可直接提交）；
+    - 方案须使故障管段两端都与所有水源断开；
+    - 优选顺序：新增失供用水点数最少 → 本次关阀数最少 →
+      关阀编号序列（按字典序排序后）字典序最小。
+
+    实现：候选阀门为“位于某条水源→故障端路径上”的未关闭有阀管段
+    （不在任何此类路径上的阀门无助于隔离，只会增加失供与关阀数，
+    任何包含它的方案都被去掉它后的方案严格占优）；
+    按关阀数升序、同数按编号字典序枚举候选子集，用 evaluate_plan 评估。
+    新增失供数以“仅移除故障管段、不关任何阀”时的失供数为理论下界，
+    枚举中首个达到下界的方案即全局最优，可提前结束。
+    """
+    fault = pipes.get(fault_pipe_id)
+    if fault is None:
+        return RecommendResult(
+            feasible=False,
+            recommended_close_pipe_ids=[],
+            affected_sink_ids=[],
+            reason=Issue(
+                FAULT_PIPE_NOT_FOUND, f"故障管段不存在：{fault_pipe_id}", fault_pipe_id
+            ),
+        )
+
+    pipe_list = list(pipes.values())
+    pending_faults = frozenset(pid for pid in pending_fault_pipe_ids if pid in pipes)
+    already_closed = frozenset(p.id for p in pipe_list if p.has_valve and p.valve_closed)
+    base_removed = already_closed | pending_faults
+
+    # 空方案（只移除故障管段）：若已可隔离即最优（失供最少且关阀数为 0）；
+    # 其失供数同时是任何方案新增失供的理论下界（关阀只会移除更多管段）。
+    empty = evaluate_plan(
+        nodes, pipes, fault_pipe_id, [], pending_fault_pipe_ids=pending_faults
+    )
+    if empty.isolatable:
+        return RecommendResult(
+            feasible=True,
+            recommended_close_pipe_ids=[],
+            affected_sink_ids=empty.affected_sink_ids,
+        )
+    min_affected_count = len(empty.affected_sink_ids)
+
+    # 方案图（移除故障管段后）中：水源侧与故障端侧各自的可达范围
+    fault_removed = base_removed | frozenset({fault_pipe_id})
+    source_side = _reachable(nodes, pipe_list, fault_removed)
+    fault_side = _reachable_from(
+        nodes, pipe_list, fault_removed, (fault.from_node, fault.to_node)
+    )
+
+    # 候选阀门：未关闭、非故障管段本身，且一端在水源侧、一端在故障端侧
+    candidates = sorted(
+        p.id
+        for p in pipe_list
+        if p.has_valve
+        and not p.valve_closed
+        and p.id != fault_pipe_id
+        and (
+            (p.from_node in source_side and p.to_node in fault_side)
+            or (p.to_node in source_side and p.from_node in fault_side)
+        )
+    )
+
+    best: tuple[tuple, list[str], list[str]] | None = None
+    for size in range(1, len(candidates) + 1):
+        for combo in combinations(candidates, size):
+            result = evaluate_plan(
+                nodes,
+                pipes,
+                fault_pipe_id,
+                list(combo),
+                pending_fault_pipe_ids=pending_faults,
+            )
+            if not result.isolatable:
+                continue
+            key = (len(result.affected_sink_ids), size, combo)
+            if best is None or key < best[0]:
+                best = (key, list(combo), result.affected_sink_ids)
+            if len(result.affected_sink_ids) == min_affected_count:
+                # 达到理论下界：size 升序 + 组合字典序，首个即全局最优
+                return RecommendResult(
+                    feasible=True,
+                    recommended_close_pipe_ids=list(combo),
+                    affected_sink_ids=result.affected_sink_ids,
+                )
+
+    if best is None:
+        return RecommendResult(
+            feasible=False,
+            recommended_close_pipe_ids=[],
+            affected_sink_ids=[],
+            reason=Issue(
+                NO_FEASIBLE_PLAN,
+                f"关闭全部可用阀门后，故障管段 {fault_pipe_id} 仍至少有一端"
+                "可从水源到达，无可行关阀方案",
+                fault_pipe_id,
+            ),
+        )
+    return RecommendResult(
+        feasible=True,
+        recommended_close_pipe_ids=best[1],
+        affected_sink_ids=best[2],
     )

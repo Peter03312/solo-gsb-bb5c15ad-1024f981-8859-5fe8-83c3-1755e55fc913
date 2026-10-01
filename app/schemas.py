@@ -49,6 +49,13 @@ class PlanIn(BaseModel):
     version: int = Field(ge=0, description="读取管网时的版本号，空网为 0")
 
 
+class RecommendIn(BaseModel):
+    """关阀建议入参：只知道故障管段编号与已读版本。"""
+
+    fault_pipe_id: str = Field(min_length=1, description="故障管段编号")
+    version: int = Field(ge=0, description="读取管网时的版本号，空网为 0")
+
+
 # ---------------------------------------------------------------- 响应模型
 
 
@@ -95,6 +102,22 @@ class PreviewOut(BaseModel):
     isolatable: bool
     affected_sink_ids: list[str]
     issues: list[IssueOut]
+
+
+class RecommendReasonOut(BaseModel):
+    code: str
+    message: str
+    pipe_id: str | None = None
+
+
+class RecommendOut(BaseModel):
+    version: int
+    version_match: bool
+    fault_pipe_id: str
+    feasible: bool
+    recommended_close_pipe_ids: list[str]
+    affected_sink_ids: list[str]
+    reason: RecommendReasonOut | None = None
 
 
 class SubmitOut(BaseModel):

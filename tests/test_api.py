@@ -633,6 +633,177 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(body["isolatable"])
         self.assertEqual(body["affected_sink_ids"], ["U2"])
 
+    # ---------------------------------------------------------- 关阀建议
+
+    def test_recommend_basic_and_submittable(self):
+        self._import()
+        r = self.client.post(
+            "/api/isolation/recommend",
+            json={"fault_pipe_id": "P6", "version": 1},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["version"], 1)
+        self.assertTrue(body["version_match"])
+        self.assertEqual(body["fault_pipe_id"], "P6")
+        self.assertTrue(body["feasible"])
+        self.assertEqual(body["recommended_close_pipe_ids"], ["P4"])
+        self.assertEqual(body["affected_sink_ids"], ["U3"])
+        self.assertIsNone(body["reason"])
+        # 只读：版本、阀位、事件均未变化
+        self.assertEqual(STORE.version, 1)
+        self.assertFalse(STORE.pipes["P4"].valve_closed)
+        self.assertEqual(STORE.events, [])
+        # 建议可直接提交：同一版本提交成功
+        r = self.client.post(
+            "/api/isolation/submit",
+            json={
+                "fault_pipe_id": "P6",
+                "close_pipe_ids": body["recommended_close_pipe_ids"],
+                "version": body["version"],
+            },
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["closed_pipe_ids"], ["P4"])
+        self.assertEqual(r.json()["affected_sink_ids"], ["U3"])
+
+    def test_recommend_stale_version_flag(self):
+        self._import()
+        r = self.client.post(
+            "/api/isolation/recommend",
+            json={"fault_pipe_id": "P6", "version": 5},
+        )
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertFalse(body["version_match"])
+        self.assertEqual(body["version"], 1)
+        self.assertTrue(body["feasible"])
+
+    def test_recommend_fault_pipe_not_found(self):
+        self._import()
+        r = self.client.post(
+            "/api/isolation/recommend",
+            json={"fault_pipe_id": "PX", "version": 1},
+        )
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertFalse(body["feasible"])
+        self.assertEqual(body["recommended_close_pipe_ids"], [])
+        self.assertEqual(body["affected_sink_ids"], [])
+        self.assertEqual(body["reason"]["code"], "FAULT_PIPE_NOT_FOUND")
+        # 不改状态
+        self.assertEqual(STORE.version, 1)
+
+    def test_recommend_no_feasible_plan(self):
+        self._import()
+        # 故障管段 P1 直连水源：S 端恒可达，无可行方案
+        r = self.client.post(
+            "/api/isolation/recommend",
+            json={"fault_pipe_id": "P1", "version": 1},
+        )
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertFalse(body["feasible"])
+        self.assertEqual(body["reason"]["code"], "NO_FEASIBLE_PLAN")
+        self.assertEqual(STORE.version, 1)
+
+    def test_recommend_excludes_closed_valves_and_counts_pending_faults(self):
+        self._import()
+        # 先提交事件：故障 P6，关 P4（版本变为 2）
+        r = self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": "P6", "close_pipe_ids": ["P4"], "version": 1},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        # 新故障 P5（B-U2）：建议不得包含已关闭的 P4，
+        # 待修复故障 P6 不计通行，U3 已失供不重复计入
+        r = self.client.post(
+            "/api/isolation/recommend",
+            json={"fault_pipe_id": "P5", "version": 2},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertTrue(body["feasible"])
+        self.assertEqual(body["recommended_close_pipe_ids"], ["P2"])
+        self.assertEqual(body["affected_sink_ids"], ["U2"])
+        # 只读：建议后版本与阀位不变
+        self.assertEqual(STORE.version, 2)
+        # 按建议提交成功（版本 3）
+        r = self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": "P5", "close_pipe_ids": ["P2"], "version": 2},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["version"], 3)
+
+    def test_recommend_empty_plan_when_fault_already_isolated(self):
+        self._import()
+        r = self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": "P6", "close_pipe_ids": ["P4"], "version": 1},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        # 故障管段两端已与水源断开：建议空方案
+        r = self.client.post(
+            "/api/isolation/recommend",
+            json={"fault_pipe_id": "P6", "version": 2},
+        )
+        body = r.json()
+        self.assertTrue(body["feasible"])
+        self.assertEqual(body["recommended_close_pipe_ids"], [])
+        self.assertEqual(body["affected_sink_ids"], [])
+
+    def test_recommend_submit_stale_version_conflict(self):
+        self._import()
+        r = self.client.post(
+            "/api/isolation/recommend",
+            json={"fault_pipe_id": "P6", "version": 1},
+        )
+        rec = r.json()
+        # 期间发生另一次提交，版本变为 2：按旧版本提交建议 -> 409（沿用现有冲突处理）
+        r = self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": "P5", "close_pipe_ids": ["P2"], "version": 1},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        r = self.client.post(
+            "/api/isolation/submit",
+            json={
+                "fault_pipe_id": "P6",
+                "close_pipe_ids": rec["recommended_close_pipe_ids"],
+                "version": rec["version"],
+            },
+        )
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["error"]["code"], "VERSION_CONFLICT")
+        # 重新按最新版本建议并提交 -> 成功
+        r = self.client.post(
+            "/api/isolation/recommend",
+            json={"fault_pipe_id": "P6", "version": 2},
+        )
+        rec = r.json()
+        self.assertTrue(rec["version_match"])
+        r = self.client.post(
+            "/api/isolation/submit",
+            json={
+                "fault_pipe_id": "P6",
+                "close_pipe_ids": rec["recommended_close_pipe_ids"],
+                "version": rec["version"],
+            },
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["version"], 3)
+
+    def test_recommend_request_body_validation_422(self):
+        self._import()
+        r = self.client.post(
+            "/api/isolation/recommend",
+            json={"fault_pipe_id": "P6", "version": -1},
+        )
+        self.assertEqual(r.status_code, 422)
+        r = self.client.post("/api/isolation/recommend", json={"version": 1})
+        self.assertEqual(r.status_code, 422)
+
     def test_reimport_invalidates_old_events_for_restore(self):
         self._submit_two_faults()
         r = self.client.post("/api/network/import", json=RESTORE_NETWORK)

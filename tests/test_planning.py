@@ -13,6 +13,7 @@ from app.planning import (  # noqa: E402
     Pipe,
     evaluate_plan,
     evaluate_restore,
+    recommend_plan,
     validate_import,
     DUPLICATE_NODE_ID,
     DUPLICATE_PIPE_ID,
@@ -25,6 +26,7 @@ from app.planning import (  # noqa: E402
     CLOSE_PIPE_DUPLICATE,
     CLOSE_PIPE_IS_FAULT,
     FAULT_REWATER_RISK,
+    NO_FEASIBLE_PLAN,
 )
 
 
@@ -287,6 +289,152 @@ class RestorePlanningTests(unittest.TestCase):
         # P2 关闭时 B/D 侧整体仍无水，U3/U4 不会恢复，但也无风险
         self.assertTrue(result.safe)
         self.assertEqual(result.restored_sink_ids, [])
+
+
+def build_series_demo():
+    """串联阀门管网：任一单阀都能隔离故障，用于检验字典序 tie-break。
+
+    S --PB(v)-- J1 --PA(v)-- J2 --PX(无阀,故障)-- U1
+    """
+    nodes = {
+        "S": Node("S", "source"),
+        "J1": Node("J1", "junction"),
+        "J2": Node("J2", "junction"),
+        "U1": Node("U1", "sink"),
+    }
+    pipes = {
+        "PB": Pipe("PB", "S", "J1", has_valve=True),
+        "PA": Pipe("PA", "J1", "J2", has_valve=True),
+        "PX": Pipe("PX", "J2", "U1", has_valve=False),
+    }
+    return nodes, pipes
+
+
+def build_ring_demo(with_branch_sinks=True):
+    """环形管网：B 经 P1（A-B）与 P3+P8（A-C-B）双路进水。
+
+    S --P9(v)-- A --P1(v)-- B --PF(无阀,故障)-- D --P5(v)-- U1
+                 |          |
+                 P3(v)      P2(v)-- U2
+                 |
+                 C --P8(v)--（回到 B）
+    with_branch_sinks=True 时增加 A/C 侧用水点（P7->U3、P4->U4）。
+    """
+    nodes = {
+        "S": Node("S", "source"),
+        "A": Node("A", "junction"),
+        "B": Node("B", "junction"),
+        "C": Node("C", "junction"),
+        "D": Node("D", "junction"),
+        "U1": Node("U1", "sink"),
+        "U2": Node("U2", "sink"),
+    }
+    pipes = {
+        "P9": Pipe("P9", "S", "A", has_valve=True),
+        "P1": Pipe("P1", "A", "B", has_valve=True),
+        "P3": Pipe("P3", "A", "C", has_valve=True),
+        "P8": Pipe("P8", "C", "B", has_valve=True),
+        "PF": Pipe("PF", "B", "D", has_valve=False),
+        "P5": Pipe("P5", "D", "U1", has_valve=True),
+        "P2": Pipe("P2", "B", "U2", has_valve=True),
+    }
+    if with_branch_sinks:
+        nodes["U3"] = Node("U3", "sink")
+        nodes["U4"] = Node("U4", "sink")
+        pipes["P7"] = Pipe("P7", "A", "U3", has_valve=True)
+        pipes["P4"] = Pipe("P4", "C", "U4", has_valve=True)
+    return nodes, pipes
+
+
+class RecommendPlanTests(unittest.TestCase):
+    def test_basic_recommendation(self):
+        nodes, pipes = build_demo()
+        result = recommend_plan(nodes, pipes, "P6")
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.recommended_close_pipe_ids, ["P4"])
+        self.assertEqual(result.affected_sink_ids, ["U3"])
+        self.assertIsNone(result.reason)
+
+    def test_fault_pipe_not_found(self):
+        nodes, pipes = build_demo()
+        result = recommend_plan(nodes, pipes, "PX")
+        self.assertFalse(result.feasible)
+        self.assertEqual(result.recommended_close_pipe_ids, [])
+        self.assertEqual(result.affected_sink_ids, [])
+        self.assertEqual(result.reason.code, FAULT_PIPE_NOT_FOUND)
+
+    def test_no_feasible_plan_when_fault_touches_source(self):
+        # 故障管段 P1 直连水源：S 端恒可达，关任何阀都无法隔离
+        nodes, pipes = build_demo()
+        result = recommend_plan(nodes, pipes, "P1")
+        self.assertFalse(result.feasible)
+        self.assertEqual(result.reason.code, NO_FEASIBLE_PLAN)
+
+    def test_empty_plan_when_fault_already_isolated(self):
+        nodes, pipes = build_demo()
+        pipes["P4"] = Pipe("P4", "B", "D", has_valve=True, valve_closed=True)
+        # P4 已关闭，故障 P6 两端本就不通水：建议空方案（关阀数 0 最优）
+        result = recommend_plan(nodes, pipes, "P6")
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.recommended_close_pipe_ids, [])
+        self.assertEqual(result.affected_sink_ids, [])
+
+    def test_closed_valves_and_pending_faults_are_respected(self):
+        nodes, pipes = build_demo()
+        # P4 已关闭、P6 为其他待修复事件的故障管段
+        pipes["P4"] = Pipe("P4", "B", "D", has_valve=True, valve_closed=True)
+        result = recommend_plan(
+            nodes, pipes, "P5", pending_fault_pipe_ids=frozenset({"P6"})
+        )
+        # 建议不得包含已关闭的 P4；关 P2 即可隔离 B 侧，仅 U2 新增失供
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.recommended_close_pipe_ids, ["P2"])
+        self.assertEqual(result.affected_sink_ids, ["U2"])
+
+    def test_fault_pipe_itself_never_recommended(self):
+        # 故障管段 P5 自带阀门：建议仍须绕开它（提交接口拒绝关故障管段本身）
+        nodes, pipes = build_demo()
+        result = recommend_plan(nodes, pipes, "P5")
+        self.assertTrue(result.feasible)
+        self.assertNotIn("P5", result.recommended_close_pipe_ids)
+        self.assertEqual(result.recommended_close_pipe_ids, ["P2"])
+
+    def test_lexicographic_tie_break(self):
+        # 关 PB 或 PA 都能隔离且失供相同（U1）：取编号字典序最小者 PA
+        nodes, pipes = build_series_demo()
+        result = recommend_plan(nodes, pipes, "PX")
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.recommended_close_pipe_ids, ["PA"])
+        self.assertEqual(result.affected_sink_ids, ["U1"])
+
+    def test_fewer_affected_sinks_beats_fewer_valves(self):
+        # 环形：关干管 P9 只动 1 个阀但 U1-U4 全部失供；
+        # 关 P1+P8 两个阀只失供 U1/U2 -> 失供最少优先
+        nodes, pipes = build_ring_demo(with_branch_sinks=True)
+        result = recommend_plan(nodes, pipes, "PF")
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.recommended_close_pipe_ids, ["P1", "P8"])
+        self.assertEqual(result.affected_sink_ids, ["U1", "U2"])
+
+    def test_fewer_valves_beats_lexicographically_smaller_set(self):
+        # 无支线用水点：{P9}（1 阀）与 {P1,P3}/{P1,P8}（2 阀）失供相同，
+        # 关阀数最少优先于编号字典序 -> 选 P9
+        nodes, pipes = build_ring_demo(with_branch_sinks=False)
+        result = recommend_plan(nodes, pipes, "PF")
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.recommended_close_pipe_ids, ["P9"])
+        self.assertEqual(result.affected_sink_ids, ["U1", "U2"])
+
+    def test_recommendation_is_submittable(self):
+        # 建议结果直接交给 evaluate_plan(for_submit=True) 复核：可隔离且无阻断问题
+        nodes, pipes = build_demo()
+        result = recommend_plan(nodes, pipes, "P6")
+        check = evaluate_plan(
+            nodes, pipes, "P6", result.recommended_close_pipe_ids, for_submit=True
+        )
+        self.assertTrue(check.isolatable)
+        self.assertEqual(check.issues, [])
+        self.assertEqual(check.affected_sink_ids, result.affected_sink_ids)
 
 
 if __name__ == "__main__":

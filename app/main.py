@@ -4,6 +4,7 @@
 - GET  /health                                         健康检查
 - POST /api/network/import                             整网导入（替换式，版本重置为 1）
 - GET  /api/network                                    读取当前管网与版本
+- POST /api/isolation/recommend                        关阀建议（只读，按当前管网计算可提交方案）
 - POST /api/isolation/preview                          隔离方案预演（只读）
 - POST /api/isolation/submit                           隔离方案提交（原子关阀 + 版本 +1）
 - GET  /api/isolation/events                           隔离/复供操作历史
@@ -22,16 +23,19 @@ from .planning import (
     Pipe,
     evaluate_plan,
     evaluate_restore,
+    recommend_plan,
     validate_import,
     BLOCKING_ISSUE_CODES,
 )
 from .schemas import (
     ImportIn,
     PlanIn,
+    RecommendIn,
     RestoreIn,
     ImportOut,
     NetworkOut,
     PreviewOut,
+    RecommendOut,
     SubmitOut,
     RestorePreviewOut,
     RestoreOut,
@@ -39,6 +43,7 @@ from .schemas import (
 )
 from .serializers import (
     serialize_preview,
+    serialize_recommend,
     serialize_restore_preview,
     serialize_snapshot,
 )
@@ -152,6 +157,28 @@ def get_network():
 
 
 # ---------------------------------------------------------------- 隔离
+
+
+@app.post(
+    "/api/isolation/recommend",
+    response_model=RecommendOut,
+    tags=["故障隔离"],
+    summary="关阀建议：只知道故障管段时，按当前管网计算一套可提交的关阀方案（只读）",
+)
+def recommend_isolation(payload: RecommendIn):
+    with db.get_conn() as conn:
+        version, _updated_at, nodes, pipes = db.load_snapshot(conn)
+        pending_fault_ids = frozenset(
+            e["fault_pipe_id"] for e in db.list_open_events(conn)
+        )
+
+    result = recommend_plan(
+        nodes,
+        pipes,
+        payload.fault_pipe_id,
+        pending_fault_pipe_ids=pending_fault_ids,
+    )
+    return serialize_recommend(version, payload.version, payload.fault_pipe_id, result)
 
 
 @app.post(

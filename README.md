@@ -3,6 +3,7 @@
 基于 **Python 3.12 + FastAPI + PostgreSQL** 的供水管网故障隔离与复供服务。
 
 支持录入带编号的**水源(source)**、**用水点(sink)**、**连接点(junction)**及两端节点明确的**管段**（管段可设阀门）；
+操作员只知道**故障管段编号**时，可请求**关阀建议**：按当前管网只读计算一套可直接提交的关阀方案；
 针对一条故障管段，预演并提交阀门关闭方案，自动判断**能否隔离**并计算**失供用水点**；
 隔离提交后生成带编号的隔离事件（区分**待修复 open / 已复供 restored**），
 修复完成后操作员按**事件编号 + 当前管网版本**预演并确认**复供**，系统复核重开阀门后其余待修复故障是否仍被安全隔离。
@@ -85,6 +86,18 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 - 提交在**单个数据库事务**内完成：行级锁校验版本 → 更新阀位 → 版本号 +1 → 写隔离事件（状态 `open`），原子生效。
 - 整网导入为替换式：重写全部节点/管段、清空历史、版本重置为 `1`（旧事件随之失效）。
 
+**关阀建议**（`POST /api/isolation/recommend`，**只读**，不改阀位/版本/事件）：
+
+- 入参只需 `fault_pipe_id` 与已读 `version`；返回当前版本、`version_match`、
+  拟关闭的尚未关闭阀门（`recommended_close_pipe_ids`）与预计失供用水点（`affected_sink_ids`）；
+- 已关闭阀门与其他待修复事件的故障管段均不可通行；故障管段**两端**都须与所有水源断开；
+- 本次只从**尚未关闭的有阀管段**中选取，且不含故障管段本身（与提交接口约束一致，保证建议可直接提交）；
+- 优选顺序：**新增失供用水点数最少** → **本次关阀数最少** → 关阀编号序列（排序后）**字典序最小**；
+- 故障管段不存在（`FAULT_PIPE_NOT_FOUND`）或关闭全部可用阀门仍无法隔离（`NO_FEASIBLE_PLAN`）时，
+  返回 `feasible=false` 并在 `reason` 中给出原因，**不改任何状态**；
+- 建议的提交仍走现有 `POST /api/isolation/submit`，按最新状态复核；
+  版本过期沿用 `409 VERSION_CONFLICT` 冲突处理（重新建议后再提交即可）。
+
 **复供判定**（操作员按 `事件编号 + 当前版本` 操作；复供图 = 重开该事件阀门，其他待修复故障管段继续移除）：
 
 - 复供预演 `POST /api/isolation/events/{event_id}/restore/preview` 为**只读**：
@@ -107,6 +120,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 | GET | `/health` | 健康检查 |
 | POST | `/api/network/import` | 整网导入（版本重置为 1，旧事件失效） |
 | GET | `/api/network` | 读取当前管网与版本 |
+| POST | `/api/isolation/recommend` | 关阀建议（只读，按当前管网计算可提交方案） |
 | POST | `/api/isolation/preview` | 隔离方案预演（只读，计入待修复故障） |
 | POST | `/api/isolation/submit` | 提交隔离（原子关阀 + 版本 +1，事件状态 open） |
 | GET | `/api/isolation/events` | 隔离/复供操作历史（含 open / restored 状态） |
@@ -341,6 +355,72 @@ curl -s -X POST http://localhost:8000/api/isolation/events/1/restore \
 - 整网重新导入后旧事件编号失效 → `404 EVENT_NOT_FOUND`。
 - 复供预演遇到过期版本不拒绝，只返回 `version_match=false`（与隔离预演一致）。
 
+### 8. 关阀建议（只知道故障管段时）
+
+操作员只知道故障管段编号时，无需手工构造关阀列表，直接请求建议（**只读**，不改任何状态）：
+
+```bash
+curl -s -X POST http://localhost:8000/api/isolation/recommend \
+  -H 'Content-Type: application/json' \
+  -d '{"fault_pipe_id":"P6","version":1}'
+```
+
+响应（建议关 `P4`，预计 `U3` 失供；`version_match=false` 表示已读版本过期，应重新读取）：
+
+```json
+{
+  "version": 1,
+  "version_match": true,
+  "fault_pipe_id": "P6",
+  "feasible": true,
+  "recommended_close_pipe_ids": ["P4"],
+  "affected_sink_ids": ["U3"],
+  "reason": null
+}
+```
+
+建议方案可直接交给现有提交接口（按最新状态复核，版本过期仍为 `409 VERSION_CONFLICT`）：
+
+```bash
+curl -s -X POST http://localhost:8000/api/isolation/submit \
+  -H 'Content-Type: application/json' \
+  -d '{"fault_pipe_id":"P6","close_pipe_ids":["P4"],"version":1}'
+```
+
+无法给出建议时返回 `feasible=false` 并在 `reason` 中说明原因（状态不变）：
+
+- 故障管段不存在 → `reason.code = FAULT_PIPE_NOT_FOUND`；
+- 关闭全部可用阀门后故障管段仍有端点与水源相通（如故障管段直连水源且无阀可关）
+  → `reason.code = NO_FEASIBLE_PLAN`。
+
+```json
+{
+  "version": 1,
+  "version_match": true,
+  "fault_pipe_id": "P1",
+  "feasible": false,
+  "recommended_close_pipe_ids": [],
+  "affected_sink_ids": [],
+  "reason": {
+    "code": "NO_FEASIBLE_PLAN",
+    "message": "关闭全部可用阀门后，故障管段 P1 仍至少有一端可从水源到达，无可行关阀方案",
+    "pipe_id": "P1"
+  }
+}
+```
+
+关阀建议全流程演示脚本（标准库实现）：
+
+```bash
+python3 examples/recommend_demo.py
+# 或指定地址：
+python3 examples/recommend_demo.py http://localhost:8000
+```
+
+脚本依次演示：导入 → 建议（故障 P6）→ 按建议提交 → 已隔离故障的空方案建议 →
+新故障建议（不含已关闭阀门）→ 过期版本提交 409 → 按当前版本提交 →
+无可行方案 / 故障管段不存在 → 确认建议全程只读。
+
 ### 一键完整演示脚本（标准库实现，无需安装依赖）
 
 ```bash
@@ -361,13 +441,13 @@ python3 examples/restore_demo.py http://localhost:8000
 
 ## 七、测试
 
-核心图算法与校验逻辑（`tests/test_planning.py`，22 个用例）不依赖数据库与第三方库，可直接用标准库运行：
+核心图算法与校验逻辑（`tests/test_planning.py`，32 个用例）不依赖数据库与第三方库，可直接用标准库运行：
 
 ```bash
 python3 -m unittest tests.test_planning -v
 ```
 
-路由层集成测试（`tests/test_api.py`，23 个用例）用内存替身替换数据库，覆盖完整 HTTP 契约（含复供预演/确认、版本与安全拒绝、整网替换失效），需先安装依赖：
+路由层集成测试（`tests/test_api.py`，31 个用例）用内存替身替换数据库，覆盖完整 HTTP 契约（含关阀建议、复供预演/确认、版本与安全拒绝、整网替换失效），需先安装依赖：
 
 ```bash
 pip install -r requirements.txt httpx
@@ -380,7 +460,7 @@ python3 -m unittest discover -s tests -v
 app/
   config.py       # 环境变量配置
   schemas.py      # Pydantic 请求/响应模型
-  planning.py     # 纯领域逻辑：导入校验、无向图可达性(BFS)、隔离评估、复供安全评估
+  planning.py     # 纯领域逻辑：导入校验、无向图可达性(BFS)、隔离评估、复供安全评估、关阀建议
   db.py           # PostgreSQL：DDL/迁移、快照、整网导入、事务化隔离提交、事务化复供、历史
   serializers.py  # 响应序列化
   main.py         # FastAPI 路由与错误处理
@@ -389,6 +469,7 @@ examples/
   restore_network.json    # 复供演示管网（叠加故障）
   demo.py                 # 隔离全流程示例
   restore_demo.py         # 复供全流程示例
+  recommend_demo.py       # 关阀建议全流程示例
 tests/
   test_planning.py
   test_api.py
